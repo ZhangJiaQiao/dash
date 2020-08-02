@@ -80,6 +80,7 @@ struct range {
   int length; /*if this is the variable length key, use this parameter to
                  indicate the length of the key*/
   void *workload;
+  void *value_workload;
   uint64_t random_num;
   struct timeval tv;
 };
@@ -218,12 +219,13 @@ void generate_16B(void *memory_region, uint64_t generate_num, int length,
 }
 
 template <class T>
-void Load(int kv_num, Hash<T> *index, int length, void *workload) {
+void Load(int kv_num, Hash<T> *index, int length, void *workload, void *value_workload) {
   std::cout << "Start load warm-up workload" << std::endl;
   if (kv_num == 0) return;
   std::string fixed("fixed");
   T *_worklod = reinterpret_cast<T *>(workload);
   T key;
+  Value_t value;
   if constexpr (!std::is_pointer_v<T>) {
     for (uint64_t i = 0; i < kv_num; ++i) {
       index->Insert(_worklod[i], DEFAULT);
@@ -233,7 +235,8 @@ void Load(int kv_num, Hash<T> *index, int length, void *workload) {
     int string_key_size = sizeof(string_key) + length;
     for (uint64_t i = 0; i < kv_num; ++i) {
       key = reinterpret_cast<T>(persist_workload + i * string_key_size);
-      index->Insert(key, DEFAULT);
+      value = reinterpret_cast<Value_t>(persist_workload + i * 200);
+      index->Insert(key, value);
     }
   }
   std::cout << "Finish loading " << kv_num << " keys" << std::endl;
@@ -288,6 +291,7 @@ void concurr_insert(struct range *_range, Hash<T> *index) {
   int begin = _range->begin;
   int end = _range->end;
   char *workload = reinterpret_cast<char *>(_range->workload);
+  char *value_workload = reinterpret_cast<char *>(_range->value_workload);
   T key;
   uint64_t repeat_key = 0;
 
@@ -314,6 +318,7 @@ void concurr_insert(struct range *_range, Hash<T> *index) {
     }
   } else {
     T var_key;
+    Value_t cur_value;
     uint64_t round = (end - begin) / EPOCH_DURATION;
     uint64_t i = 0;
     uint64_t string_key_size = sizeof(string_key) + _range->length;
@@ -324,7 +329,8 @@ void concurr_insert(struct range *_range, Hash<T> *index) {
       uint64_t _end = begin + (i + 1) * EPOCH_DURATION;
       for (uint64_t j = begin + i * EPOCH_DURATION; j < _end; ++j) {
         var_key = reinterpret_cast<T>(workload + string_key_size * j);
-        index->Insert(var_key, DEFAULT, true);
+        cur_value = reinterpret_cast<Value_t>(value_workload + 200 * j);
+        index->Insert(var_key, cur_value, true);
       }
       ++i;
     }
@@ -333,7 +339,8 @@ void concurr_insert(struct range *_range, Hash<T> *index) {
       auto epoch_guard = Allocator::AquireEpochGuard();
       for (i = begin + EPOCH_DURATION * round; i < end; ++i) {
         var_key = reinterpret_cast<T>(workload + string_key_size * i);
-        index->Insert(var_key, DEFAULT, true);
+        cur_value = reinterpret_cast<Value_t>(value_workload + 200 * i);
+        index->Insert(var_key, cur_value, true);
       }
     }
   }
@@ -973,27 +980,37 @@ void Run() {
   /* Initialize Index for Finger_EH*/
   uniform_generator = new uniform_key_generator_t();
   Hash<T> *index = InitializeIndex<T>(initCap);
-  uint64_t generate_num = operation_num * 2 + load_num;
+  uint64_t generate_num = operation_num + load_num;
   /* Generate the workload and corresponding range array*/
   std::cout << "Generate workload" << std::endl;
   void *workload;
+  void *value_workload;
   if (distribution == "uniform") {
     workload = GenerateWorkload(generate_num, var_length);
+    value_workload = GenerateWorkload(generate_num, 200);
   } else {
     workload = GenerateSkewWorkload(load_num, operation_num, operation_num,
                                     var_length);
   }
 
   void *insert_workload;
+  void *insert_value_workload;
   if (key_type != "fixed") {
     PMEMoid ptr;
     Allocator::Allocate(&ptr, kCacheLineSize,
                         (sizeof(string_key) + var_length) * generate_num, NULL,
                         NULL);
+    PMEMoid vptr;
+    Allocator::Allocate(&vptr, kCacheLineSize,
+                        200 * generate_num, NULL,
+                        NULL);
     insert_workload = pmemobj_direct(ptr);
+    insert_value_workload = pmemobj_direct(vptr);
     std::cout << "allocate finish for pm" << std::endl;
     memcpy(insert_workload, workload,
            (sizeof(string_key) + var_length) * generate_num);
+    memcpy(insert_value_workload, value_workload,
+    200 * generate_num);
   } else {
     insert_workload = workload;
   }
@@ -1003,6 +1020,7 @@ void Run() {
   Load<T>(load_num, index, var_length, insert_workload);
   void *not_used_workload;
   void *not_used_insert_workload;
+  void *not_used_insert_value_workload;
 
   if (key_type == "fixed") {
     uint64_t *key_array = reinterpret_cast<uint64_t *>(workload);
@@ -1011,10 +1029,12 @@ void Run() {
   } else {
     char *key_array = reinterpret_cast<char *>(workload);
     char *persist_key_array = reinterpret_cast<char *>(insert_workload);
+    char *persist_value_array = reinterpret_cast<char *>(insert_value_workload);
     not_used_workload =
         key_array + (sizeof(string_key) + var_length) * load_num;
     not_used_insert_workload =
         persist_key_array + (sizeof(string_key) + var_length) * load_num;
+    not_used_insert_value_workload = persist_value_array + 200 * load_num;
   }
 
   /* Description of the workload*/
@@ -1029,6 +1049,7 @@ void Run() {
     rarray[i].end = (i + 1) * chunk_size;
     rarray[i].length = var_length;
     rarray[i].workload = not_used_workload;
+    rarray[i].value_workload = not_used_insert_value_workload;
   }
   rarray[thread_num - 1].end = operation_num;
 
@@ -1131,7 +1152,7 @@ void Run() {
       GeneralBench<T>(rarray, index, thread_num, operation_num, "Pos_search",
                       &concurr_search_without_epoch);
     }
-
+    /*
     for (int i = 0; i < thread_num; ++i) {
       rarray[i].begin = operation_num + i * chunk_size;
       rarray[i].end = operation_num + (i + 1) * chunk_size;
@@ -1159,6 +1180,7 @@ void Run() {
                       &concurr_delete_without_epoch);
     }
     index->getNumber();
+    */
   }
 
   /*TODO Free the workload memory*/
